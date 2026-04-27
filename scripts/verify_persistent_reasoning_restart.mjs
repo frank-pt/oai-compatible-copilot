@@ -154,13 +154,7 @@ try {
 		{ role: SYSTEM, content: [new LanguageModelTextPart("Extra transient instruction")] },
 		{ role: USER, content: [new LanguageModelTextPart("Think first and reply READY only")] },
 	];
-
-	const secondTurnMessages = [
-		{ role: SYSTEM, content: [new LanguageModelTextPart("You are an assistant")] },
-		{ role: USER, content: [new LanguageModelTextPart("Think first and reply READY only")] },
-		{ role: ASSISTANT, content: [new LanguageModelTextPart("READY")] },
-		{ role: USER, content: [new LanguageModelTextPart("What values did you pick?")] },
-	];
+	const firstTurnResponseParts = [];
 
 	const requestBodies = [];
 	globalThis.fetch = async (_url, init) => {
@@ -179,9 +173,28 @@ try {
 		model,
 		firstTurnMessages,
 		{ tools: [], requestInitiator: "github.copilot-chat" },
-		{ report() {} },
+		{
+			report(part) {
+				firstTurnResponseParts.push(part);
+			},
+		},
 		token
 	);
+
+	const replayedAssistant = {
+		role: ASSISTANT,
+		content: [
+			new LanguageModelTextPart("READY"),
+			...firstTurnResponseParts.filter((part) => part instanceof LanguageModelDataPart),
+		],
+	};
+
+	const secondTurnMessages = [
+		{ role: SYSTEM, content: [new LanguageModelTextPart("You are an assistant")] },
+		{ role: USER, content: [new LanguageModelTextPart("Think first and reply READY only")] },
+		replayedAssistant,
+		{ role: USER, content: [new LanguageModelTextPart("What values did you pick?")] },
+	];
 
 	const secondProvider = new HuggingFaceChatModelProvider(secrets, statusBarItem, secondState);
 	await secondProvider.provideLanguageModelChatResponse(
@@ -209,6 +222,60 @@ try {
 	console.log("Persistent reasoning restart validation passed.");
 	console.log(JSON.stringify(restoredAssistant, null, 2));
 
+	const markerOnlyState = new MemoryMemento(new Map());
+	const markerOnlyProvider = new HuggingFaceChatModelProvider(secrets, statusBarItem, markerOnlyState);
+	await markerOnlyProvider.provideLanguageModelChatResponse(
+		model,
+		secondTurnMessages,
+		{ tools: [], requestInitiator: "github.copilot-chat" },
+		{ report() {} },
+		token
+	);
+
+	const markerOnlyRequest = requestBodies.at(-1);
+	const markerOnlyAssistant = markerOnlyRequest.messages.find((message) => message.role === "assistant");
+	if (!markerOnlyAssistant) {
+		throw new Error("Assistant replay message missing from marker-only request");
+	}
+	if (markerOnlyAssistant.reasoning_content !== "A=0.30,B=0.25,C=0.20,D=0.15,E=0.10") {
+		throw new Error(
+			`Reasoning marker replay failed without cache: ${markerOnlyAssistant.reasoning_content ?? "<missing>"}`
+		);
+	}
+
+	console.log("Reasoning marker replay validation passed.");
+	console.log(JSON.stringify(markerOnlyAssistant, null, 2));
+
+	const markerStrippedMessages = [
+		{ role: SYSTEM, content: [new LanguageModelTextPart("You are an assistant")] },
+		{ role: USER, content: [new LanguageModelTextPart("Think first and reply READY only")] },
+		{ role: ASSISTANT, content: [new LanguageModelTextPart("READY")] },
+		{ role: USER, content: [new LanguageModelTextPart("What values did you pick?")] },
+	];
+
+	const markerStrippedProvider = new HuggingFaceChatModelProvider(secrets, statusBarItem, secondState);
+	await markerStrippedProvider.provideLanguageModelChatResponse(
+		model,
+		markerStrippedMessages,
+		{ tools: [], requestInitiator: "github.copilot-chat" },
+		{ report() {} },
+		token
+	);
+
+	const markerStrippedRequest = requestBodies.at(-1);
+	const markerStrippedAssistant = markerStrippedRequest.messages.find((message) => message.role === "assistant");
+	if (!markerStrippedAssistant) {
+		throw new Error("Assistant replay message missing from marker-stripped request");
+	}
+	if (markerStrippedAssistant.reasoning_content !== "A=0.30,B=0.25,C=0.20,D=0.15,E=0.10") {
+		throw new Error(
+			`Legacy reasoning fallback failed after marker stripping: ${markerStrippedAssistant.reasoning_content ?? "<missing>"}`
+		);
+	}
+
+	console.log("Legacy reasoning fallback validation passed.");
+	console.log(JSON.stringify(markerStrippedAssistant, null, 2));
+
 	const thirdProvider = new HuggingFaceChatModelProvider(secrets, statusBarItem, secondState);
 	await thirdProvider.provideLanguageModelChatResponse(
 		model,
@@ -223,8 +290,10 @@ try {
 	if (!thirdAssistant) {
 		throw new Error("Assistant replay message missing from third request");
 	}
-	if (thirdAssistant.reasoning_content !== undefined) {
-		throw new Error("Reasoning unexpectedly leaked across requestInitiator boundaries");
+	if (thirdAssistant.reasoning_content !== "") {
+		throw new Error(
+			`Missing reasoning should serialize as empty string across requestInitiator boundaries, got ${thirdAssistant.reasoning_content ?? "<missing>"}`
+		);
 	}
 
 	console.log("requestInitiator partition validation passed.");

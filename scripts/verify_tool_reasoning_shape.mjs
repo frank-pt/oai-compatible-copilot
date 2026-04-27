@@ -113,9 +113,19 @@ try {
 
 	const api = new OpenaiApi();
 	const converted = api.convertMessages(messages, { includeReasoningInRequest: true });
+	const convertedWithoutThinking = api.convertMessages(
+		[
+			{
+				role: ASSISTANT,
+				content: [new LanguageModelToolCallPart("call_weather_2", "get_weather", { city: "Shanghai" })],
+			},
+		],
+		{ includeReasoningInRequest: true }
+	);
 
 	const assistantMessage = converted.find((message) => message.role === "assistant");
 	const toolMessage = converted.find((message) => message.role === "tool");
+	const assistantWithoutThinking = convertedWithoutThinking.find((message) => message.role === "assistant");
 
 	if (!assistantMessage) {
 		throw new Error("Assistant message missing from converted output");
@@ -134,6 +144,14 @@ try {
 	}
 	if (toolMessage.content !== '{"weather":"Sunny","temp":"25°C"}') {
 		throw new Error("Tool result content mismatch");
+	}
+	if (!assistantWithoutThinking) {
+		throw new Error("Assistant tool-call-only message missing from converted output");
+	}
+	if (assistantWithoutThinking.reasoning_content !== "") {
+		throw new Error(
+			`Assistant tool-call-only message should serialize empty reasoning_content, got ${assistantWithoutThinking.reasoning_content ?? "<missing>"}`
+		);
 	}
 	if (!toolConfig.tools || toolConfig.tools.length !== 1 || toolConfig.tools[0].function.name !== "get_weather") {
 		throw new Error("Top-level tools configuration mismatch");

@@ -179,7 +179,7 @@ try {
 		{ role: SYSTEM, content: [new LanguageModelTextPart("You are an assistant")] },
 		{ role: USER, content: [new LanguageModelTextPart("What's the weather like in Beijing?")] },
 	];
-
+	const firstTurnResponseParts = [];
 	const replayedAssistant = {
 		role: mockVscode.LanguageModelChatMessageRole.Assistant,
 		content: [
@@ -201,6 +201,23 @@ try {
 			],
 		},
 		{ role: USER, content: [new LanguageModelTextPart("Summarize the result.")] },
+	];
+	const secondTurnMessagesWithoutReasoning = [
+		firstTurnMessages[0],
+		firstTurnMessages[1],
+		{
+			role: mockVscode.LanguageModelChatMessageRole.Assistant,
+			content: [new LanguageModelToolCallPart("call_weather_2", "get_weather", { city: "Shanghai" })],
+		},
+		{
+			role: USER,
+			content: [
+				new LanguageModelToolResultPart("call_weather_2", [
+					new LanguageModelTextPart('{"weather":"Cloudy","temp":"20°C"}'),
+				]),
+			],
+		},
+		{ role: USER, content: [new LanguageModelTextPart("Summarize Shanghai too.")] },
 	];
 
 	const requestBodies = [];
@@ -227,9 +244,14 @@ try {
 		reasoningOnModel,
 		firstTurnMessages,
 		{ tools: [weatherTool], requestInitiator: "github.copilot-chat" },
-		{ report() {} },
+		{
+			report(part) {
+				firstTurnResponseParts.push(part);
+			},
+		},
 		token
 	);
+	replayedAssistant.content.push(...firstTurnResponseParts.filter((part) => part instanceof LanguageModelDataPart));
 
 	const secondProvider = new HuggingFaceChatModelProvider(secrets, statusBarItem, reasoningState);
 	await secondProvider.provideLanguageModelChatResponse(
@@ -270,6 +292,31 @@ try {
 
 	console.log("Tool reasoning replay validation passed.");
 	console.log(JSON.stringify({ assistantMessage, toolMessage }, null, 2));
+
+	const fallbackProvider = new HuggingFaceChatModelProvider(secrets, statusBarItem, reasoningState);
+	await fallbackProvider.provideLanguageModelChatResponse(
+		reasoningOnModel,
+		secondTurnMessagesWithoutReasoning,
+		{ tools: [weatherTool], requestInitiator: "github.copilot-chat" },
+		{ report() {} },
+		token
+	);
+
+	const missingReasoningFallbackRequest = requestBodies.at(-1);
+	const fallbackAssistant = missingReasoningFallbackRequest.messages.find(
+		(message) => message.role === "assistant" && message.tool_calls?.[0]?.id === "call_weather_2"
+	);
+	if (!fallbackAssistant) {
+		throw new Error("Assistant fallback replay message missing for empty reasoning case");
+	}
+	if (fallbackAssistant.reasoning_content !== "") {
+		throw new Error(
+			`Assistant fallback replay message should carry empty reasoning_content, got ${fallbackAssistant.reasoning_content ?? "<missing>"}`
+		);
+	}
+
+	console.log("Tool reasoning empty-field fallback validation passed.");
+	console.log(JSON.stringify(fallbackAssistant, null, 2));
 
 	const thirdProvider = new HuggingFaceChatModelProvider(secrets, statusBarItem, reasoningState);
 	await thirdProvider.provideLanguageModelChatResponse(

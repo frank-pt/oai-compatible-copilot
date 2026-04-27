@@ -90,7 +90,10 @@ export class OpenaiApi extends CommonApi<OpenAIChatMessage, Record<string, unkno
 					assistantMessage.content = joinedText;
 				}
 
-				if (modelConfig.includeReasoningInRequest && joinedThinking) {
+				if (modelConfig.includeReasoningInRequest) {
+					// DeepSeek thinking mode expects assistant turns to carry the
+					// reasoning_content field on replay, even when the current turn
+					// does not expose a restorable reasoning payload locally.
 					assistantMessage.reasoning_content = joinedThinking;
 				}
 

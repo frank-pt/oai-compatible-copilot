@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { LanguageModelChatRequestMessage, LanguageModelChatTool } from "vscode";
 import { tokenizerManager } from "./tokenizer/tokenizerManager";
 import { getImageDimensions } from "./tokenizer/imageUtils";
-import { createDataUrl } from "./utils";
+import { createDataUrl, isInternalMarkerMimeType } from "./utils";
 
 /*
  * Each message comes with 3 tokens per message due to special characters
@@ -31,6 +31,8 @@ export async function countMessageTokens(
 				// Estimate tokens for image or data parts based on type
 				if (part.mimeType.startsWith("image/")) {
 					totalTokens += calculateImageTokenCost(createDataUrl(part));
+				} else if (isInternalMarkerMimeType(part.mimeType)) {
+					/* ignore */
 				} else if (part.mimeType === "cache_control") {
 					/* ignore */
 				} else {

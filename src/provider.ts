@@ -1,4 +1,8 @@
 import * as vscode from "vscode";
+import { randomUUID } from "node:crypto";
+import { appendFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 import {
 	CancellationToken,
@@ -22,6 +26,7 @@ import {
 	mapRole,
 	isToolResultPart,
 	collectToolResultText,
+	isInternalMarkerMimeType,
 } from "./utils";
 
 import { prepareLanguageModelChatInformation } from "./provideModel";
@@ -36,6 +41,102 @@ import { GeminiApi, buildGeminiGenerateContentUrl, type GeminiToolCallMeta } fro
 import type { GeminiGenerateContentRequest } from "./gemini/geminiTypes";
 import { CommonApi } from "./commonApi";
 
+const DEBUG_LOG_PATH = path.join(tmpdir(), "oaicopilot-deepseek-debug.log");
+const DEBUG_LOG_ENABLED = process.env.OAICOPILOT_DEBUG_LOG === "1";
+
+function safeDebugStringify(value: unknown): string {
+	try {
+		return JSON.stringify(value, null, 2);
+	} catch (error) {
+		return JSON.stringify({
+			stringifyError: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+function summarizeChatRequestMessages(messages: readonly LanguageModelChatRequestMessage[]): Array<Record<string, unknown>> {
+	return messages.map((message, index) => {
+		const summary: Record<string, unknown> = {
+			index,
+			role: mapRole(message),
+			partTypes: [],
+			text: "",
+			thinking: "",
+			toolCalls: [],
+			toolResults: [],
+			markers: [],
+		};
+		for (const part of message.content ?? []) {
+			if (part instanceof vscode.LanguageModelTextPart) {
+				summary.partTypes = [...(summary.partTypes as unknown[]), "text"];
+				summary.text = `${summary.text ?? ""}${part.value}`;
+			} else if (part instanceof vscode.LanguageModelThinkingPart) {
+				const value = Array.isArray(part.value) ? part.value.join("") : part.value;
+				summary.partTypes = [...(summary.partTypes as unknown[]), "thinking"];
+				summary.thinking = `${summary.thinking ?? ""}${value}`;
+			} else if (part instanceof vscode.LanguageModelToolCallPart) {
+				summary.partTypes = [...(summary.partTypes as unknown[]), "tool_call"];
+				(summary.toolCalls as unknown[]).push({
+					callId: part.callId,
+					name: part.name,
+					input: part.input ?? {},
+				});
+			} else if (isToolResultPart(part)) {
+				summary.partTypes = [...(summary.partTypes as unknown[]), "tool_result"];
+				(summary.toolResults as unknown[]).push({
+					callId: part.callId,
+					content: collectToolResultText(part),
+				});
+			} else if (part instanceof vscode.LanguageModelDataPart) {
+				summary.partTypes = [...(summary.partTypes as unknown[]), `data:${part.mimeType}`];
+				if (isInternalMarkerMimeType(part.mimeType)) {
+					(summary.markers as unknown[]).push(part.mimeType);
+				}
+			}
+		}
+		return summary;
+	});
+}
+
+function summarizeOpenAIChatMessages(messages: readonly unknown[]): Array<Record<string, unknown>> {
+	return messages.map((message, index) => {
+		const normalized = (message ?? {}) as {
+			role?: unknown;
+			content?: unknown;
+			reasoning_content?: unknown;
+			tool_calls?: unknown;
+			tool_call_id?: unknown;
+		};
+		return {
+		index,
+		role: normalized.role,
+		content: normalized.content,
+		reasoning_content: normalized.reasoning_content,
+		tool_calls: normalized.tool_calls,
+		tool_call_id: normalized.tool_call_id,
+		};
+	});
+}
+
+async function appendDeepSeekDebugLog(event: string, payload: Record<string, unknown>): Promise<void> {
+	if (!DEBUG_LOG_ENABLED) {
+		return;
+	}
+	const line = [
+		`=== ${new Date().toISOString()} ${event} ===`,
+		safeDebugStringify(payload),
+		"",
+	].join("\n");
+	try {
+		await appendFile(DEBUG_LOG_PATH, line, "utf8");
+	} catch (error) {
+		console.error("[OAI Compatible Model Provider] Failed to write debug log", {
+			path: DEBUG_LOG_PATH,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
 /**
  * VS Code Chat provider backed by Hugging Face Inference Providers.
  */
@@ -48,6 +149,8 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 	private readonly _openaiChatReasoningCache: PersistentOpenAIChatReasoningCache;
 
 	static readonly OPENAI_RESPONSES_STATEFUL_MARKER_MIME = "application/vnd.oaicopilot.stateful-marker";
+	static readonly OPENAI_CHAT_STATE_MARKER_MIME = "application/vnd.oaicopilot.openai-chat-state";
+	static readonly OPENAI_CHAT_REASONING_MARKER_MIME = "application/vnd.oaicopilot.openai-chat-reasoning";
 
 	/**
 	 * Create a provider using the given secret storage for the API key.
@@ -208,6 +311,17 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 				// send Ollama chat request with retry
 				const url = `${BASE_URL.replace(/\/+$/, "")}/api/chat`;
+				void appendDeepSeekDebugLog("request-preflight", {
+					modelId: model.id,
+					baseModelId: parsedModelId.baseId,
+					requestInitiator: options.requestInitiator,
+					apiMode,
+					baseUrl: BASE_URL,
+					url,
+					originalMessages: summarizeChatRequestMessages(messages),
+					requestBody: ollamaRequestBody,
+					debugLogPath: DEBUG_LOG_PATH,
+				});
 				const response = await executeWithRetry(async () => {
 					const res = await fetch(url, {
 						method: "POST",
@@ -218,6 +332,20 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					if (!res.ok) {
 						const errorText = await res.text();
 						console.error("[Ollama Provider] Ollama API error response", errorText);
+						void appendDeepSeekDebugLog("request-error", {
+							modelId: model.id,
+							baseModelId: parsedModelId.baseId,
+							requestInitiator: options.requestInitiator,
+							apiMode,
+							baseUrl: BASE_URL,
+							url,
+							status: res.status,
+							statusText: res.statusText,
+							errorText,
+							originalMessages: summarizeChatRequestMessages(messages),
+							requestBody: ollamaRequestBody,
+							debugLogPath: DEBUG_LOG_PATH,
+						});
 						throw new Error(
 							`Ollama API error: [${res.status}] ${res.statusText}${errorText ? `\n${errorText}` : ""}\nURL: ${url}`
 						);
@@ -251,6 +379,17 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 				const url = normalizedBaseUrl.endsWith("/v1")
 					? `${normalizedBaseUrl}/messages`
 					: `${normalizedBaseUrl}/v1/messages`;
+				void appendDeepSeekDebugLog("request-preflight", {
+					modelId: model.id,
+					baseModelId: parsedModelId.baseId,
+					requestInitiator: options.requestInitiator,
+					apiMode,
+					baseUrl: BASE_URL,
+					url,
+					originalMessages: summarizeChatRequestMessages(messages),
+					requestBody,
+					debugLogPath: DEBUG_LOG_PATH,
+				});
 				const response = await executeWithRetry(async () => {
 					const res = await fetch(url, {
 						method: "POST",
@@ -261,6 +400,20 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					if (!res.ok) {
 						const errorText = await res.text();
 						console.error("[Anthropic Provider] Anthropic API error response", errorText);
+						void appendDeepSeekDebugLog("request-error", {
+							modelId: model.id,
+							baseModelId: parsedModelId.baseId,
+							requestInitiator: options.requestInitiator,
+							apiMode,
+							baseUrl: BASE_URL,
+							url,
+							status: res.status,
+							statusText: res.statusText,
+							errorText,
+							originalMessages: summarizeChatRequestMessages(messages),
+							requestBody,
+							debugLogPath: DEBUG_LOG_PATH,
+						});
 						throw new Error(
 							`Anthropic API error: [${res.status}] ${res.statusText}${errorText ? `\n${errorText}` : ""}\nURL: ${url}`
 						);
@@ -321,8 +474,19 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					addedPreviousResponseId = true;
 				}
 
-				const sendRequest = async (body: Record<string, unknown>) =>
-					await executeWithRetry(async () => {
+				const sendRequest = async (body: Record<string, unknown>) => {
+					void appendDeepSeekDebugLog("request-preflight", {
+						modelId: model.id,
+						baseModelId: parsedModelId.baseId,
+						requestInitiator: options.requestInitiator,
+						apiMode,
+						baseUrl: BASE_URL,
+						url,
+						originalMessages: summarizeChatRequestMessages(messages),
+						requestBody: body,
+						debugLogPath: DEBUG_LOG_PATH,
+					});
+					return await executeWithRetry(async () => {
 						const res = await fetch(url, {
 							method: "POST",
 							headers: requestHeaders,
@@ -331,6 +495,20 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 						if (!res.ok) {
 							const errorText = await res.text();
+							void appendDeepSeekDebugLog("request-error", {
+								modelId: model.id,
+								baseModelId: parsedModelId.baseId,
+								requestInitiator: options.requestInitiator,
+								apiMode,
+								baseUrl: BASE_URL,
+								url,
+								status: res.status,
+								statusText: res.statusText,
+								errorText,
+								originalMessages: summarizeChatRequestMessages(messages),
+								requestBody: body,
+								debugLogPath: DEBUG_LOG_PATH,
+							});
 							const error = new Error(
 								`Responses API error: [${res.status}] ${res.statusText}${errorText ? `\n${errorText}` : ""}\nURL: ${url}`
 							);
@@ -341,6 +519,7 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 						return res;
 					}, retryConfig);
+				};
 
 				let response: Response;
 				try {
@@ -415,6 +594,17 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					throw new Error("Invalid Gemini base URL configuration.");
 				}
 
+				void appendDeepSeekDebugLog("request-preflight", {
+					modelId: model.id,
+					baseModelId: parsedModelId.baseId,
+					requestInitiator: options.requestInitiator,
+					apiMode,
+					baseUrl: BASE_URL,
+					url,
+					originalMessages: summarizeChatRequestMessages(messages),
+					requestBody,
+					debugLogPath: DEBUG_LOG_PATH,
+				});
 				const response = await executeWithRetry(async () => {
 					const res = await fetch(url, {
 						method: "POST",
@@ -425,6 +615,20 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					if (!res.ok) {
 						const errorText = await res.text();
 						console.error("[Gemini Provider] Gemini API error response", errorText);
+						void appendDeepSeekDebugLog("request-error", {
+							modelId: model.id,
+							baseModelId: parsedModelId.baseId,
+							requestInitiator: options.requestInitiator,
+							apiMode,
+							baseUrl: BASE_URL,
+							url,
+							status: res.status,
+							statusText: res.statusText,
+							errorText,
+							originalMessages: summarizeChatRequestMessages(messages),
+							requestBody,
+							debugLogPath: DEBUG_LOG_PATH,
+						});
 						throw new Error(
 							`Gemini API error: [${res.status}] ${res.statusText}${errorText ? `\n${errorText}` : ""}\nURL: ${url}`
 						);
@@ -437,45 +641,86 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 					throw new Error("No response body from Gemini API");
 				}
 				await geminiApi.processStreamingResponse(response.body, trackingProgress, token);
-			} else {
-				// OpenAI compatible API mode (default)
-				const openaiApi = new OpenaiApi();
+				} else {
+					// OpenAI compatible API mode (default)
+					const openaiApi = new OpenaiApi();
+					const reasoningModelScopeId = parsedModelId.configId ? model.id : parsedModelId.baseId;
+					const openAIChatConversationState = modelConfig.includeReasoningInRequest
+					? getOrCreateOpenAIChatConversationState(reasoningModelScopeId, options.requestInitiator, messages)
+					: null;
 				const restoredMessages = modelConfig.includeReasoningInRequest
 					? restoreOpenAIChatReasoningMessages(
-							parsedModelId.baseId,
+							reasoningModelScopeId,
 							options.requestInitiator,
 							messages,
 							this._openaiChatReasoningCache
 						)
-					: messages;
-				const openaiMessages = openaiApi.convertMessages(restoredMessages, modelConfig);
+						: messages;
+					const openaiMessages = openaiApi.convertMessages(restoredMessages, modelConfig);
 
-				// requestBody
-				let requestBody: Record<string, unknown> = {
+					// requestBody
+					let requestBody: Record<string, unknown> = {
 					model: parsedModelId.baseId,
 					messages: openaiMessages,
 					stream: true,
-					stream_options: { include_usage: true },
-				};
-				requestBody = openaiApi.prepareRequestBody(requestBody, um, options);
-				// console.debug("[OAI Compatible Model Provider] RequestBody:", JSON.stringify(requestBody));
+						stream_options: { include_usage: true },
+					};
+					requestBody = openaiApi.prepareRequestBody(requestBody, um, options);
+					{
+						void appendDeepSeekDebugLog("request-preflight", {
+							modelId: model.id,
+							baseModelId: parsedModelId.baseId,
+							requestInitiator: options.requestInitiator,
+							apiMode,
+							baseUrl: BASE_URL,
+							includeReasoningInRequest: modelConfig.includeReasoningInRequest,
+							reasoningModelScopeId,
+							conversationId: openAIChatConversationState?.conversationId ?? null,
+							originalMessages: summarizeChatRequestMessages(messages),
+							restoredMessages: summarizeChatRequestMessages(restoredMessages),
+							openaiMessages: summarizeOpenAIChatMessages(openaiMessages),
+							requestBody,
+							debugLogPath: DEBUG_LOG_PATH,
+						});
+					}
 
-				// send chat request with retry
-				const url = `${BASE_URL.replace(/\/+$/, "")}/chat/completions`;
-				const response = await executeWithRetry(async () => {
-					const res = await fetch(url, {
+					// send chat request with retry
+					const url = `${BASE_URL.replace(/\/+$/, "")}/chat/completions`;
+					const response = await executeWithRetry(async () => {
+						const res = await fetch(url, {
 						method: "POST",
 						headers: requestHeaders,
 						body: JSON.stringify(requestBody),
 					});
 
-					if (!res.ok) {
-						const errorText = await res.text();
-						console.error("[OAI Compatible Model Provider] OAI Compatible API error response", errorText);
-						throw new Error(
-							`OAI Compatible API error: [${res.status}] ${res.statusText}${errorText ? `\n${errorText}` : ""}\nURL: ${url}`
-						);
-					}
+						if (!res.ok) {
+							const errorText = await res.text();
+							console.error("[OAI Compatible Model Provider] OAI Compatible API error response", errorText);
+							{
+								void appendDeepSeekDebugLog("request-error", {
+									modelId: model.id,
+									baseModelId: parsedModelId.baseId,
+									requestInitiator: options.requestInitiator,
+									apiMode,
+									baseUrl: BASE_URL,
+									url,
+									status: res.status,
+									statusText: res.statusText,
+									errorText,
+									includeReasoningInRequest: modelConfig.includeReasoningInRequest,
+									reasoningModelScopeId,
+									conversationId: openAIChatConversationState?.conversationId ?? null,
+									originalMessages: summarizeChatRequestMessages(messages),
+									restoredMessages: summarizeChatRequestMessages(restoredMessages),
+									openaiMessages: summarizeOpenAIChatMessages(openaiMessages),
+									requestBody,
+									debugLogPath: DEBUG_LOG_PATH,
+								});
+							}
+							throw new Error(
+								`OAI Compatible API error: [${res.status}] ${res.statusText}${errorText ? `\n${errorText}` : ""}\nURL: ${url}`
+							);
+						}
 
 					return res;
 				}, retryConfig);
@@ -505,15 +750,40 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 
 				await openaiApi.processStreamingResponse(response.body, openaiTrackingProgress, token);
 
-				if (modelConfig.includeReasoningInRequest && aggregatedReasoning.trim()) {
-					await this._openaiChatReasoningCache.remember(
-						parsedModelId.baseId,
-						options.requestInitiator,
-						messages,
-						aggregatedAssistantText,
-						responseToolCalls,
-						aggregatedReasoning
+				const hasVisibleOrReasoningResponse =
+					!!aggregatedAssistantText || responseToolCalls.length > 0 || !!aggregatedReasoning.trim();
+				if (modelConfig.includeReasoningInRequest && openAIChatConversationState && hasVisibleOrReasoningResponse) {
+					const messageId = randomUUID();
+					trackingProgress.report(
+						createOpenAIChatStateMarkerPart(
+							reasoningModelScopeId,
+							options.requestInitiator,
+							openAIChatConversationState.conversationId,
+							messageId
+						)
 					);
+
+					if (aggregatedReasoning.trim()) {
+						trackingProgress.report(
+							createOpenAIChatReasoningMarkerPart(
+								reasoningModelScopeId,
+								options.requestInitiator,
+								openAIChatConversationState.conversationId,
+								messageId,
+								aggregatedReasoning
+							)
+						);
+						await this._openaiChatReasoningCache.remember(
+							reasoningModelScopeId,
+							options.requestInitiator,
+							openAIChatConversationState.conversationId,
+							messageId,
+							aggregatedReasoning,
+							messages,
+							aggregatedAssistantText,
+							responseToolCalls
+						);
+					}
 				}
 			}
 		} catch (err) {
@@ -580,7 +850,21 @@ export class HuggingFaceChatModelProvider implements LanguageModelChatProvider {
 type OpenAIResponsesStatefulMarkerLocation = { marker: string; index: number };
 type OpenAIChatToolCallSignature = { callId: string; name: string; inputJson: string };
 
-const OPENAI_CHAT_REASONING_CACHE_LIMIT = 256;
+type OpenAIChatConversationState = { conversationId: string };
+type OpenAIChatStateMarkerPayload = {
+	version: 1;
+	modelId: string;
+	requestInitiator?: string;
+	conversationId: string;
+	messageId: string;
+};
+type OpenAIChatReasoningMarkerPayload = OpenAIChatStateMarkerPayload & {
+	reasoning: string;
+};
+
+const OPENAI_CHAT_REASONING_CACHE_TOTAL_LIMIT = 8192;
+const OPENAI_CHAT_REASONING_CACHE_SESSION_LIMIT = 2048;
+const OPENAI_CHAT_REASONING_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 
 function createOpenAIResponsesStatefulMarkerPart(modelId: string, marker: string): vscode.LanguageModelDataPart {
 	const payload = `${modelId}\\${marker}`;
@@ -618,6 +902,165 @@ function parseOpenAIResponsesStatefulMarkerPart(part: unknown): { modelId: strin
 	} catch {
 		return null;
 	}
+}
+
+function createCompressedMarkerPart(mimeType: string, payload: Record<string, unknown>): vscode.LanguageModelDataPart {
+	return new vscode.LanguageModelDataPart(gzipSync(JSON.stringify(payload)), mimeType);
+}
+
+function parseCompressedMarkerPart<T extends Record<string, unknown>>(part: unknown, mimeType: string): T | null {
+	const maybe = part as { mimeType?: unknown; data?: unknown };
+	if (!maybe || typeof maybe !== "object") {
+		return null;
+	}
+	if (maybe.mimeType !== mimeType) {
+		return null;
+	}
+	if (!(maybe.data instanceof Uint8Array)) {
+		return null;
+	}
+
+	try {
+		const decoded = gunzipSync(Buffer.from(maybe.data)).toString("utf8");
+		const parsed = JSON.parse(decoded);
+		return parsed && typeof parsed === "object" ? (parsed as T) : null;
+	} catch {
+		return null;
+	}
+}
+
+function createOpenAIChatStateMarkerPart(
+	modelId: string,
+	requestInitiator: string,
+	conversationId: string,
+	messageId: string
+): vscode.LanguageModelDataPart {
+	return createCompressedMarkerPart(HuggingFaceChatModelProvider.OPENAI_CHAT_STATE_MARKER_MIME, {
+		version: 1,
+		modelId,
+		requestInitiator,
+		conversationId,
+		messageId,
+	});
+}
+
+function parseOpenAIChatStateMarkerPart(part: unknown): OpenAIChatStateMarkerPayload | null {
+	const parsed = parseCompressedMarkerPart<OpenAIChatStateMarkerPayload>(
+		part,
+		HuggingFaceChatModelProvider.OPENAI_CHAT_STATE_MARKER_MIME
+	);
+	if (!parsed || parsed.version !== 1) {
+		return null;
+	}
+	if (!parsed.modelId || !parsed.conversationId || !parsed.messageId) {
+		return null;
+	}
+	return parsed;
+}
+
+function createOpenAIChatReasoningMarkerPart(
+	modelId: string,
+	requestInitiator: string,
+	conversationId: string,
+	messageId: string,
+	reasoning: string
+): vscode.LanguageModelDataPart {
+	return createCompressedMarkerPart(HuggingFaceChatModelProvider.OPENAI_CHAT_REASONING_MARKER_MIME, {
+		version: 1,
+		modelId,
+		requestInitiator,
+		conversationId,
+		messageId,
+		reasoning,
+	});
+}
+
+function markerMatchesRequestInitiator(
+	marker: { requestInitiator?: string },
+	requestInitiator: string,
+	allowLegacyMarker: boolean
+): boolean {
+	if (!marker.requestInitiator) {
+		return allowLegacyMarker;
+	}
+	return marker.requestInitiator === requestInitiator;
+}
+
+function parseOpenAIChatReasoningMarkerPart(part: unknown): OpenAIChatReasoningMarkerPayload | null {
+	const parsed = parseCompressedMarkerPart<OpenAIChatReasoningMarkerPayload>(
+		part,
+		HuggingFaceChatModelProvider.OPENAI_CHAT_REASONING_MARKER_MIME
+	);
+	if (!parsed || parsed.version !== 1) {
+		return null;
+	}
+	if (!parsed.modelId || !parsed.conversationId || !parsed.messageId || typeof parsed.reasoning !== "string") {
+		return null;
+	}
+	return parsed;
+}
+
+function extractOpenAIChatMessageState(
+	modelId: string,
+	content: readonly unknown[],
+	requestInitiator: string,
+	allowLegacyMarker = true
+): OpenAIChatStateMarkerPayload | null {
+	for (const part of content) {
+		const stateMarker = parseOpenAIChatStateMarkerPart(part);
+		if (
+			stateMarker &&
+			stateMarker.modelId === modelId &&
+			markerMatchesRequestInitiator(stateMarker, requestInitiator, allowLegacyMarker)
+		) {
+			return stateMarker;
+		}
+		const reasoningMarker = parseOpenAIChatReasoningMarkerPart(part);
+		if (
+			reasoningMarker &&
+			reasoningMarker.modelId === modelId &&
+			markerMatchesRequestInitiator(reasoningMarker, requestInitiator, allowLegacyMarker)
+		) {
+			return reasoningMarker;
+		}
+	}
+	return null;
+}
+
+function extractOpenAIChatMessageReasoning(
+	modelId: string,
+	content: readonly unknown[],
+	requestInitiator: string
+): OpenAIChatReasoningMarkerPayload | null {
+	for (const part of content) {
+		const marker = parseOpenAIChatReasoningMarkerPart(part);
+		if (
+			marker &&
+			marker.modelId === modelId &&
+			markerMatchesRequestInitiator(marker, requestInitiator, false)
+		) {
+			return marker;
+		}
+	}
+	return null;
+}
+
+function getOrCreateOpenAIChatConversationState(
+	modelId: string,
+	requestInitiator: string,
+	messages: readonly LanguageModelChatRequestMessage[]
+): OpenAIChatConversationState {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== vscode.LanguageModelChatMessageRole.Assistant) {
+			continue;
+		}
+		const state = extractOpenAIChatMessageState(modelId, message.content ?? [], requestInitiator, true);
+		if (state) {
+			return { conversationId: state.conversationId };
+		}
+	}
+	return { conversationId: randomUUID() };
 }
 
 function findLastOpenAIResponsesStatefulMarker(
@@ -661,14 +1104,30 @@ function restoreOpenAIChatReasoningMessages(
 			return message;
 		}
 
-		const { assistantText, toolCalls } = extractAssistantMessageSignature(content);
-		const restoredReasoning = reasoningCache.recall(
-			modelId,
-			requestInitiator,
-			messages.slice(0, messageIndex),
-			assistantText,
-			toolCalls
-		);
+		const markerReasoning = extractOpenAIChatMessageReasoning(modelId, content, requestInitiator)?.reasoning ?? "";
+		const stateMarker = extractOpenAIChatMessageState(modelId, content, requestInitiator, true);
+		let restoredReasoning = markerReasoning;
+		if (!restoredReasoning && stateMarker) {
+			restoredReasoning = reasoningCache.recall(
+				modelId,
+				requestInitiator,
+				stateMarker.conversationId,
+				stateMarker.messageId
+			);
+		}
+		if (!restoredReasoning) {
+			const { assistantText, toolCalls } = extractAssistantMessageSignature(content);
+			// VS Code can omit internal marker/data parts when replaying assistant turns back
+			// into the provider. Fall back to the persisted signature-based lookup so
+			// preserved thinking still works for the same request initiator.
+			restoredReasoning = reasoningCache.recallLegacy(
+				modelId,
+				requestInitiator,
+				messages.slice(0, messageIndex),
+				assistantText,
+				toolCalls
+			);
+		}
 		if (!restoredReasoning) {
 			return message;
 		}
@@ -773,6 +1232,9 @@ function normalizeMessageForReasoningCache(message: LanguageModelChatRequestMess
 			continue;
 		}
 		if (part instanceof vscode.LanguageModelDataPart) {
+			if (isInternalMarkerMimeType(part.mimeType)) {
+				continue;
+			}
 			normalizedContent.push({ type: "data", mimeType: part.mimeType, byteLength: part.data.byteLength });
 		}
 	}
@@ -799,20 +1261,107 @@ type PersistentReasoningEntry = {
 	updatedAt: number;
 };
 
+type PersistentReasoningMessageRecord = {
+	messageId: string;
+	payload: string;
+	updatedAt: number;
+};
+
+type PersistentReasoningSessionRecord = {
+	sessionKey: string;
+	modelId: string;
+	requestInitiator: string;
+	conversationId: string;
+	updatedAt: number;
+	messages: PersistentReasoningMessageRecord[];
+};
+
+type PersistentReasoningSessionBucket = Omit<PersistentReasoningSessionRecord, "messages"> & {
+	messages: Map<string, PersistentReasoningMessageRecord>;
+};
+
+type PersistentReasoningIndexRecord = {
+	key: string;
+	sessionKey: string;
+	messageId: string;
+	updatedAt: number;
+};
+
 class PersistentOpenAIChatReasoningCache {
-	private static readonly STORAGE_KEY = "oaicopilot.openaiChatReasoningCache.v2";
-	private readonly entries = new Map<string, PersistentReasoningEntry>();
+	private static readonly LEGACY_STORAGE_KEY = "oaicopilot.openaiChatReasoningCache.v2";
+	private static readonly STORAGE_KEY = "oaicopilot.openaiChatReasoningCache.v3";
+	private static readonly INDEX_STORAGE_KEY = "oaicopilot.openaiChatReasoningCache.v3.indices";
+	private readonly sessions = new Map<string, PersistentReasoningSessionBucket>();
+	private readonly legacyEntries = new Map<string, PersistentReasoningEntry>();
+	private readonly indices = new Map<string, PersistentReasoningIndexRecord>();
 
 	constructor(private readonly state: vscode.Memento) {
-		const stored = state.get<PersistentReasoningEntry[]>(PersistentOpenAIChatReasoningCache.STORAGE_KEY, []);
-		for (const entry of stored) {
+		const now = Date.now();
+		const stored = state.get<PersistentReasoningSessionRecord[]>(PersistentOpenAIChatReasoningCache.STORAGE_KEY, []);
+		for (const session of stored) {
+			if (!session?.sessionKey || !session.modelId || !session.requestInitiator || !session.conversationId) {
+				continue;
+			}
+			if (typeof session.updatedAt !== "number" || now - session.updatedAt > OPENAI_CHAT_REASONING_CACHE_TTL_MS) {
+				continue;
+			}
+			const messages = new Map<string, PersistentReasoningMessageRecord>();
+			for (const entry of session.messages ?? []) {
+				if (!entry?.messageId || !entry.payload || typeof entry.updatedAt !== "number") {
+					continue;
+				}
+				if (now - entry.updatedAt > OPENAI_CHAT_REASONING_CACHE_TTL_MS) {
+					continue;
+				}
+				messages.set(entry.messageId, entry);
+			}
+			if (messages.size === 0) {
+				continue;
+			}
+			this.sessions.set(session.sessionKey, { ...session, messages });
+		}
+
+		const legacy = state.get<PersistentReasoningEntry[]>(PersistentOpenAIChatReasoningCache.LEGACY_STORAGE_KEY, []);
+		for (const entry of legacy) {
 			if (entry?.key && entry?.payload) {
-				this.entries.set(entry.key, entry);
+				this.legacyEntries.set(entry.key, entry);
 			}
 		}
+
+		const indices = state.get<PersistentReasoningIndexRecord[]>(PersistentOpenAIChatReasoningCache.INDEX_STORAGE_KEY, []);
+		for (const entry of indices) {
+			if (!entry?.key || !entry.sessionKey || !entry.messageId || typeof entry.updatedAt !== "number") {
+				continue;
+			}
+			if (now - entry.updatedAt > OPENAI_CHAT_REASONING_CACHE_TTL_MS) {
+				continue;
+			}
+			this.indices.set(entry.key, entry);
+		}
+		this.pruneInMemory();
 	}
 
 	recall(
+		modelId: string,
+		requestInitiator: string,
+		conversationId: string,
+		messageId: string
+	): string {
+		const sessionKey = this.buildSessionKey(modelId, requestInitiator, conversationId);
+		const entry = this.touchSessionMessage(sessionKey, messageId);
+		if (!entry) {
+			return "";
+		}
+		try {
+			return this.decodePayload(entry.payload);
+		} catch {
+			this.removeMessage(sessionKey, messageId);
+			void this.flush();
+			return "";
+		}
+	}
+
+	recallLegacy(
 		modelId: string,
 		requestInitiator: string,
 		prefixMessages: readonly LanguageModelChatRequestMessage[],
@@ -832,16 +1381,30 @@ class PersistentOpenAIChatReasoningCache {
 			assistantText,
 			toolCalls
 		);
-		const matchedKey = this.entries.has(key) ? key : this.entries.has(fallbackKey) ? fallbackKey : "";
-		const entry = matchedKey ? this.entries.get(matchedKey) : undefined;
+		const indexed = this.indices.get(key) ?? this.indices.get(fallbackKey);
+		if (indexed) {
+			const entry = this.touchSessionMessage(indexed.sessionKey, indexed.messageId);
+			if (entry) {
+				try {
+					return this.decodePayload(entry.payload);
+				} catch {
+					this.removeMessage(indexed.sessionKey, indexed.messageId);
+					void this.flush();
+					return "";
+				}
+			}
+			this.indices.delete(indexed.key);
+			void this.flush();
+		}
+		const matchedKey = this.legacyEntries.has(key) ? key : this.legacyEntries.has(fallbackKey) ? fallbackKey : "";
+		const entry = matchedKey ? this.legacyEntries.get(matchedKey) : undefined;
 		if (!entry) {
 			return "";
 		}
 		try {
-			return gunzipSync(Buffer.from(entry.payload, "base64url")).toString("utf8");
+			return this.decodePayload(entry.payload);
 		} catch {
-			this.entries.delete(matchedKey);
-			void this.flush();
+			this.legacyEntries.delete(matchedKey);
 			return "";
 		}
 	}
@@ -849,50 +1412,180 @@ class PersistentOpenAIChatReasoningCache {
 	async remember(
 		modelId: string,
 		requestInitiator: string,
-		prefixMessages: readonly LanguageModelChatRequestMessage[],
-		assistantText: string,
-		toolCalls: readonly OpenAIChatToolCallSignature[],
-		reasoning: string
+		conversationId: string,
+		messageId: string,
+		reasoning: string,
+		prefixMessages?: readonly LanguageModelChatRequestMessage[],
+		assistantText?: string,
+		toolCalls?: readonly OpenAIChatToolCallSignature[]
 	): Promise<void> {
-		const key = buildOpenAIChatReasoningTurnCacheKey(
-			modelId,
-			requestInitiator,
-			prefixMessages,
-			assistantText,
-			toolCalls
-		);
-		const fallbackKey = buildOpenAIChatReasoningFallbackCacheKey(
-			modelId,
-			requestInitiator,
-			assistantText,
-			toolCalls
-		);
+		const sessionKey = this.buildSessionKey(modelId, requestInitiator, conversationId);
+		const now = Date.now();
 		const payload = gzipSync(reasoning).toString("base64url");
-		const upsert = (entryKey: string) => {
-			if (this.entries.has(entryKey)) {
-				this.entries.delete(entryKey);
-			}
-			this.entries.set(entryKey, { key: entryKey, payload, updatedAt: Date.now() });
-		};
-		upsert(key);
-		if (fallbackKey !== key) {
-			upsert(fallbackKey);
+		let session = this.sessions.get(sessionKey);
+		if (!session) {
+			session = {
+				sessionKey,
+				modelId,
+				requestInitiator,
+				conversationId,
+				updatedAt: now,
+				messages: new Map<string, PersistentReasoningMessageRecord>(),
+			};
+			this.sessions.set(sessionKey, session);
 		}
-		while (this.entries.size > OPENAI_CHAT_REASONING_CACHE_LIMIT) {
-			const oldestKey = this.entries.keys().next().value;
-			if (!oldestKey) {
+		session.updatedAt = now;
+		if (session.messages.has(messageId)) {
+			session.messages.delete(messageId);
+		}
+		session.messages.set(messageId, { messageId, payload, updatedAt: now });
+		if (prefixMessages && assistantText !== undefined && toolCalls) {
+			const keys = new Set([
+				buildOpenAIChatReasoningTurnCacheKey(modelId, requestInitiator, prefixMessages, assistantText, toolCalls),
+				buildOpenAIChatReasoningFallbackCacheKey(modelId, requestInitiator, assistantText, toolCalls),
+			]);
+			for (const key of keys) {
+				this.indices.set(key, { key, sessionKey, messageId, updatedAt: now });
+			}
+		}
+		this.pruneInMemory();
+		await this.flush();
+	}
+
+	private buildSessionKey(modelId: string, requestInitiator: string, conversationId: string): string {
+		return stableStringify({ modelId, requestInitiator, conversationId });
+	}
+
+	private touchSessionMessage(sessionKey: string, messageId: string): PersistentReasoningMessageRecord | null {
+		const session = this.sessions.get(sessionKey);
+		if (!session) {
+			return null;
+		}
+		const entry = session.messages.get(messageId);
+		if (!entry) {
+			return null;
+		}
+		const updatedAt = Date.now();
+		const nextEntry = { ...entry, updatedAt };
+		session.messages.delete(messageId);
+		session.messages.set(messageId, nextEntry);
+		session.updatedAt = updatedAt;
+		for (const index of this.indices.values()) {
+			if (index.sessionKey === sessionKey && index.messageId === messageId) {
+				index.updatedAt = updatedAt;
+			}
+		}
+		return nextEntry;
+	}
+
+	private removeMessage(sessionKey: string, messageId: string): void {
+		const session = this.sessions.get(sessionKey);
+		if (session) {
+			session.messages.delete(messageId);
+			if (session.messages.size === 0) {
+				this.sessions.delete(sessionKey);
+			}
+		}
+		for (const [key, index] of this.indices) {
+			if (index.sessionKey === sessionKey && index.messageId === messageId) {
+				this.indices.delete(key);
+			}
+		}
+	}
+
+	private removeSession(sessionKey: string): void {
+		this.sessions.delete(sessionKey);
+		for (const [key, index] of this.indices) {
+			if (index.sessionKey === sessionKey) {
+				this.indices.delete(key);
+			}
+		}
+	}
+
+	private decodePayload(payload: string): string {
+		return gunzipSync(Buffer.from(payload, "base64url")).toString("utf8");
+	}
+
+	private pruneInMemory(): void {
+		const now = Date.now();
+		for (const [sessionKey, session] of this.sessions) {
+			if (now - session.updatedAt > OPENAI_CHAT_REASONING_CACHE_TTL_MS) {
+				this.removeSession(sessionKey);
+				continue;
+			}
+			for (const [messageId, entry] of session.messages) {
+				if (now - entry.updatedAt > OPENAI_CHAT_REASONING_CACHE_TTL_MS) {
+					this.removeMessage(sessionKey, messageId);
+				}
+			}
+			while (session.messages.size > OPENAI_CHAT_REASONING_CACHE_SESSION_LIMIT) {
+				const oldestMessageId = session.messages.keys().next().value;
+				if (!oldestMessageId) {
+					break;
+				}
+				this.removeMessage(sessionKey, oldestMessageId);
+			}
+			if (session.messages.size === 0) {
+				this.removeSession(sessionKey);
+			}
+		}
+
+		for (const [key, index] of this.indices) {
+			if (now - index.updatedAt > OPENAI_CHAT_REASONING_CACHE_TTL_MS) {
+				this.indices.delete(key);
+				continue;
+			}
+			const session = this.sessions.get(index.sessionKey);
+			if (!session || !session.messages.has(index.messageId)) {
+				this.indices.delete(key);
+			}
+		}
+
+		while (this.totalMessageCount() > OPENAI_CHAT_REASONING_CACHE_TOTAL_LIMIT) {
+			const oldest = this.findOldestMessage();
+			if (!oldest) {
 				break;
 			}
-			this.entries.delete(oldestKey);
+			const session = this.sessions.get(oldest.sessionKey);
+			if (!session) {
+				break;
+			}
+			this.removeMessage(oldest.sessionKey, oldest.messageId);
 		}
-		await this.flush();
+	}
+
+	private totalMessageCount(): number {
+		let total = 0;
+		for (const session of this.sessions.values()) {
+			total += session.messages.size;
+		}
+		return total;
+	}
+
+	private findOldestMessage(): { sessionKey: string; messageId: string; updatedAt: number } | null {
+		let oldest: { sessionKey: string; messageId: string; updatedAt: number } | null = null;
+		for (const [sessionKey, session] of this.sessions) {
+			for (const [messageId, entry] of session.messages) {
+				if (!oldest || entry.updatedAt < oldest.updatedAt) {
+					oldest = { sessionKey, messageId, updatedAt: entry.updatedAt };
+				}
+			}
+		}
+		return oldest;
 	}
 
 	private async flush(): Promise<void> {
 		await this.state.update(
 			PersistentOpenAIChatReasoningCache.STORAGE_KEY,
-			Array.from(this.entries.values())
+			Array.from(this.sessions.values()).map((session) => ({
+				sessionKey: session.sessionKey,
+				modelId: session.modelId,
+				requestInitiator: session.requestInitiator,
+				conversationId: session.conversationId,
+				updatedAt: session.updatedAt,
+				messages: Array.from(session.messages.values()),
+			}))
 		);
+		await this.state.update(PersistentOpenAIChatReasoningCache.INDEX_STORAGE_KEY, Array.from(this.indices.values()));
 	}
 }
-

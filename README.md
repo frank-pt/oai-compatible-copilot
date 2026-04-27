@@ -475,6 +475,7 @@ All parameters support individual configuration for different models, providing 
 - `thinking`: Thinking configuration for Zai provider
   - `type`: Set to 'enabled' to enable thinking, 'disabled' to disable thinking
 - `reasoning_effort`: Reasoning effort level (OpenAI reasoning configuration)
+  - Some OpenAI-compatible providers support additional values such as `xhigh` (for example, DeepSeek maps `xhigh` to `max`)
 - `headers`: Custom HTTP headers to be sent with every request to this model's provider (e.g., `{"X-API-Version": "v1", "X-Custom-Header": "value"}`). These headers will be merged with the default headers (Authorization, Content-Type, User-Agent)
 - `extra`: Extra request body parameters.
 - `include_reasoning_in_request`: Whether to include `reasoning_content` in assistant messages sent to OpenAI-compatible `/chat/completions` APIs. When enabled, the extension also restores locally persisted reasoning for replayed assistant turns. Supports deepseek-v3.2, GLM, and similar providers.

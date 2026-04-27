@@ -187,6 +187,7 @@
 								"type": "string",
 								"default": "medium",
 								"enum": [
+									"xhigh",
 									"high",
 									"medium",
 									"low",

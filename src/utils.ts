@@ -184,6 +184,10 @@ export function isImageMimeType(mimeType: string): boolean {
 	return mimeType.startsWith("image/") && ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mimeType);
 }
 
+export function isInternalMarkerMimeType(mimeType: string): boolean {
+	return mimeType.startsWith("application/vnd.oaicopilot.");
+}
+
 /**
  * 创建图片的data URL
  */
@@ -218,6 +222,8 @@ export function collectToolResultText(pr: { content?: ReadonlyArray<unknown> }):
 		} else if (typeof c === "string") {
 			text += c;
 		} else if (c instanceof vscode.LanguageModelDataPart && c.mimeType === "cache_control") {
+			/* ignore */
+		} else if (c instanceof vscode.LanguageModelDataPart && isInternalMarkerMimeType(c.mimeType)) {
 			/* ignore */
 		} else {
 			try {
