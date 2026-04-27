@@ -28,10 +28,11 @@ import {
 } from "../utils";
 
 import { CommonApi } from "../commonApi";
+import { logger } from "../logger";
 
 export class OpenaiApi extends CommonApi<OpenAIChatMessage, Record<string, unknown>> {
-	constructor() {
-		super();
+	constructor(modelId: string) {
+		super(modelId);
 	}
 
 	/**
@@ -270,6 +271,9 @@ export class OpenaiApi extends CommonApi<OpenAIChatMessage, Record<string, unkno
 		progress: Progress<LanguageModelResponsePart2>,
 		token: CancellationToken
 	): Promise<void> {
+		const modelId = this._modelId;
+		logger.debug("openai.stream.start", { modelId });
+
 		const reader = responseBody.getReader();
 		const decoder = new TextDecoder();
 		let buffer = "";
@@ -294,6 +298,7 @@ export class OpenaiApi extends CommonApi<OpenAIChatMessage, Record<string, unkno
 						continue;
 					}
 					const data = line.slice(5).trim();
+					logger.debug("openai.stream.chunk", { modelId, data });
 					if (data === "[DONE]") {
 						// Do not throw on [DONE]; any incomplete/empty buffers are ignored.
 						await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ false);
@@ -302,14 +307,22 @@ export class OpenaiApi extends CommonApi<OpenAIChatMessage, Record<string, unkno
 
 					try {
 						const parsed = JSON.parse(data);
-						// console.debug("[OAI Compatible Model Provider] data:", JSON.stringify(parsed));
-
 						await this.processDelta(parsed, progress);
-					} catch {
-						// Silently ignore malformed SSE lines temporarily
+					} catch (e) {
+						console.error("[OpenAI Provider] Failed to parse SSE chunk:", e, "data:", data);
+						logger.error("openai.stream.chunk.error", {
+							modelId,
+							error: e instanceof Error ? e.message : String(e),
+							data,
+						});
 					}
 				}
 			}
+			logger.debug("openai.stream.done", { modelId });
+		} catch (e) {
+			console.error("[OpenAI Provider] Streaming response error:", e);
+			logger.error("openai.stream.error", { modelId, error: e instanceof Error ? e.message : String(e) });
+			throw e;
 		} finally {
 			reader.releaseLock();
 			// If there's an active thinking sequence, end it first
@@ -339,6 +352,7 @@ export class OpenaiApi extends CommonApi<OpenAIChatMessage, Record<string, unkno
 			let maybeThinking =
 				(choice as Record<string, unknown> | undefined)?.thinking ??
 				(deltaObj as Record<string, unknown> | undefined)?.thinking ??
+				(deltaObj as Record<string, unknown> | undefined)?.reasoning ??
 				(deltaObj as Record<string, unknown> | undefined)?.reasoning_content;
 
 			// OpenRouter/Claude reasoning_details array handling (new)
@@ -531,8 +545,8 @@ export class OpenaiApi extends CommonApi<OpenAIChatMessage, Record<string, unkno
 						}
 						// Handle finish reason
 						if (choice.finish_reason) break;
-					} catch {
-						// Silently ignore malformed SSE lines temporarily
+					} catch (e) {
+						console.error("[OpenAI Provider] Failed to parse SSE chunk:", e, "data:", data);
 					}
 				}
 			}
